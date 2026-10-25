@@ -1,4 +1,5 @@
 #include "tag_db.h"
+#include "od_session.h"
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -8,6 +9,7 @@
 #include <vector>
 
 #include "language.h"
+#include "radiotransport.h"
 #include "storage.h"
 #include "util.h"
 
@@ -81,6 +83,7 @@ tagRecord* addRecord(const uint8_t mac[8]) {
         taginfo = new tagRecord;
         memcpy(taginfo->mac, mac, sizeof(taginfo->mac));
         tagDB.push_back(taginfo);
+        radioAllowListChanged(mac, true);
     }
     return taginfo;
 }
@@ -93,6 +96,7 @@ bool deleteRecord(const uint8_t mac[8], bool allVersions) {
             tagDB.erase(tagDB.begin() + c);
             releaseData(tag);
             deletedRecords.push_back({tag, millis()});
+            if (tagRecord::findByMAC(mac) == nullptr) radioAllowListChanged(mac, false);
             return true;
         }
     }
@@ -146,6 +150,9 @@ String tagDBtoJson(const uint8_t mac[8], uint8_t startPos) {
         if (select && taginfo->version == 0) {
             JsonObject tag = tags.add<JsonObject>();
             fillNode(tag, taginfo);
+#ifdef HAS_BLE_WRITER
+            if (bleFamily(taginfo->mac, taginfo->hwType) == BLE_FAMILY_OPENDISPLAY) odDescribe(taginfo->mac, tag["od"].to<JsonObject>());
+#endif
             if (measureJson(doc) > 5000) {
                 doc["continu"] = c + 1;
                 break;
@@ -283,7 +290,7 @@ bool loadDB(const String& filename) {
                     taginfo->RSSI = tag["RSSI"];
                     taginfo->temperature = tag["temperature"];
                     taginfo->batteryMv = tag["batteryMv"];
-                    taginfo->hwType = (uint8_t)tag["hwType"];
+                    taginfo->hwType = (uint16_t)tag["hwType"];
                     taginfo->wakeupReason = tag["wakeupReason"];
                     taginfo->capabilities = tag["capabilities"];
                     taginfo->modeConfigJson = tag["modecfgjson"].as<String>();
@@ -364,6 +371,7 @@ void clearPending(tagRecord* taginfo) {
 void initAPconfig() {
     JsonDocument APconfig;
     File configFile = contentFS->open("/current/apconfig.json", "r");
+    const bool firstStart = !configFile;
     if (configFile) {
         DeserializationError error = deserializeJson(APconfig, configFile);
         if (error) {
@@ -409,6 +417,9 @@ void initAPconfig() {
     } else {
         strlcpy(config.timeZone, "CET-1CEST,M3.5.0,M10.5.0/3", sizeof(config.timeZone));
     }
+    // A new AP has no settings file until they are first saved. The web UI reads its settings
+    // from that file (/get_ap_config), so without it it saw none, and hid the previews.
+    if (firstStart) saveAPconfig();
 }
 
 void saveAPconfig() {
@@ -447,13 +458,17 @@ void saveAPconfig() {
     xSemaphoreGive(fsMutex);
 }
 
-HwType getHwType(const uint8_t id) {
+void forgetHwType(const uint16_t id) {
+    hwdata.erase(id);
+}
+
+HwType getHwType(const uint16_t id) {
     auto it = hwdata.find(id);
     if (it != hwdata.end()) {
         return it->second;
     } else {
         char filename[20];
-        snprintf(filename, sizeof(filename), "/tagtypes/%02X.json", id);
+        snprintf(filename, sizeof(filename), id > 0xFF ? "/tagtypes/%04X.json" : "/tagtypes/%02X.json", id);
         Serial.printf("read %s\r\n", filename);
         File jsonFile = contentFS->open(filename, "r");
 
@@ -537,10 +552,11 @@ String getBaseName(const String& filename) {
 void cleanupCurrent() {
     // clean unknown previews
     Serial.println("Cleaning up temporary files");
+    // getNextFileName() only reads the directory; openNextFile() would also stat and open every file
     File dir = contentFS->open("/current");
-    File file = dir.openNextFile();
-    while (file) {
-        String filename = file.name();
+    String path = dir.getNextFileName();
+    while (path.length()) {
+        const String filename = path.substring(path.lastIndexOf('/') + 1);
         uint8_t mac[8];
         if (hex2mac(getBaseName(filename), mac)) {
             bool found = false;
@@ -552,24 +568,19 @@ void cleanupCurrent() {
                 }
             }
             if (!found || filename.endsWith(".pending")) {
-                filename = file.path();
-                file.close();
-                Serial.println("remove " + filename);
-                contentFS->remove(filename);
+                Serial.println("remove " + path);
+                contentFS->remove(path);
             }
         }
-        file = dir.openNextFile();
+        path = dir.getNextFileName();
     }
     dir.close();
 
     dir = contentFS->open("/temp");
-    file = dir.openNextFile();
-    while (file) {
-        String filename = file.name();
-        filename = file.path();
-        file.close();
-        contentFS->remove(filename);
-        file = dir.openNextFile();
+    path = dir.getNextFileName();
+    while (path.length()) {
+        contentFS->remove(path);
+        path = dir.getNextFileName();
     }
     dir.close();
 }
@@ -601,4 +612,5 @@ void popTagInfo(const uint8_t mac[8]) {
     if (saved == nullptr) return;
     deleteRecord(mac, false);
     saved->version = 0;
+    radioAllowListChanged(mac, true);
 }

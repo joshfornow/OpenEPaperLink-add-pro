@@ -34,6 +34,7 @@
 #include "commstructs.h"
 #include "makeimage.h"
 #include "newproto.h"
+#include "od_session.h"
 #include "pendingupload.h"
 #include "storage.h"
 #ifdef CONTENT_QR
@@ -43,7 +44,7 @@
 #include "settings.h"
 #include "system.h"
 #include "tag_db.h"
-#include "truetype.h"
+#include <TinyTTF.h>
 #include "util.h"
 #include "web.h"
 
@@ -292,6 +293,11 @@ void drawNew(const uint8_t mac[8], tagRecord *&taginfo) {
     } else {
         imageParams.g5 = 0;
     }
+#endif
+
+#ifdef HAS_BLE_WRITER
+    // OpenDisplay: buffer layout and colors from the tag's own config; the BLE upload compresses
+    if (bleFamily(mac, taginfo->hwType) == BLE_FAMILY_OPENDISPLAY) odImageParams(mac, imageParams);
 #endif
 
     imageParams.lut = EPD_LUT_NO_REPEATS;
@@ -757,7 +763,7 @@ String urlEncode(const char *msg) {
     return encodedMsg;
 }
 
-void getTemplate(JsonDocument &json, const uint8_t id, const uint8_t hwtype) {
+void getTemplate(JsonDocument &json, const uint8_t id, const uint16_t hwtype) {
     JsonDocument filter;
     JsonDocument doc;
 
@@ -765,7 +771,7 @@ void getTemplate(JsonDocument &json, const uint8_t id, const uint8_t hwtype) {
     constexpr const char *templateKey = "template";
 
     char filename[20];
-    snprintf(filename, sizeof(filename), "/tagtypes/%02X.json", hwtype);
+    snprintf(filename, sizeof(filename), hwtype > 0xFF ? "/tagtypes/%04X.json" : "/tagtypes/%02X.json", hwtype);
     File jsonFile = contentFS->open(filename, "r");
 
     if (jsonFile) {
@@ -777,7 +783,7 @@ void getTemplate(JsonDocument &json, const uint8_t id, const uint8_t hwtype) {
             json.set(doc[templateKey][idstr]);
             return;
         }
-        if (!error && doc["usetemplate"].is<uint8_t>()) {
+        if (!error && doc["usetemplate"].is<uint16_t>()) {
             getTemplate(json, id, doc["usetemplate"]);
             return;
         }

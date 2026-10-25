@@ -12,6 +12,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../../oepl-radio-v2.h"
+#include "od_keys.h"
+#include "od_session.h"
 #include "serialap.h"
 #include "settings.h"
 #include "storage.h"
@@ -22,7 +25,8 @@
 #include "util.h"
 #include "web.h"
 
-extern uint16_t sendBlock(const void* data, const uint16_t len);
+extern uint16_t sendBlock(const void* data, const uint16_t len, uint64_t ver, uint32_t offset, uint32_t totalSize);
+extern bool cacheBlock(const void* data, const uint16_t len, uint64_t ver, uint32_t offset, uint32_t totalSize);
 extern UDPcomm udpsync;
 // Queued items are heap allocated, so a PendingItem* stays valid when the vector grows. Dequeued items
 // are kept for a while before they are freed, because other tasks may still use them: a block request
@@ -143,8 +147,7 @@ void prepareCancelPending(const uint8_t dst[8]) {
         return;
     }
     clearPending(taginfo);
-    while (dequeueItem(dst)) {
-    };
+    dequeueAllItems(dst);
     taginfo->pendingCount = countQueueItem(dst);
     wsSendTaginfo(dst, SYNC_TAGSTATUS);
 }
@@ -499,12 +502,47 @@ void processBlockRequest(struct espBlockRequest* br) {
     }
     uint32_t len = queueItem->len - (BLOCK_DATA_SIZE * br->blockId);
     if (len > BLOCK_DATA_SIZE) len = BLOCK_DATA_SIZE;
-    uint16_t checksum = sendBlock(queueItem->data + (br->blockId * BLOCK_DATA_SIZE), len);
+    uint16_t checksum = sendBlock(queueItem->data + (br->blockId * BLOCK_DATA_SIZE), len, br->ver, br->blockId * BLOCK_DATA_SIZE, queueItem->len);
     char buffer[150];
     sprintf(buffer, "%02X%02X%02X%02X%02X%02X%02X%02X block request %s block %d, len %d checksum %u\0", br->src[7], br->src[6], br->src[5], br->src[4], br->src[3], br->src[2], br->src[1], br->src[0], queueItem->filename, br->blockId, len, checksum);
     wsLog((String)buffer);
     wsSendUploadProgress(br->src, br->blockId + 1, totalblocks);  // live block x/total for the tag card
     Serial.printf("<RQB file %s block %d, len %d checksum %u\r\n\0", queueItem->filename, br->blockId, len, checksum);
+}
+
+// Protocol v2 radios cache blocks: send the whole item while the tag sleeps, so the radio answers its
+// block requests without waiting for the S3. Without it (cache full, radio reset) the radio asks
+// for each block as before.
+void processPreload(struct espBlockRequest* br) {
+    if (config.runStatus == RUNSTATUS_STOP) return;
+    PendingItem* queueItem = getQueueItem(br->src, br->ver);
+    if (queueItem == nullptr || !loadQueueItemData(queueItem)) return;
+    const uint32_t t = millis();
+    uint16_t blocks = 0;
+    for (uint32_t offset = 0; offset < queueItem->len; offset += BLOCK_DATA_SIZE) {
+        const uint32_t len = queueItem->len - offset > BLOCK_DATA_SIZE ? BLOCK_DATA_SIZE : queueItem->len - offset;
+        if (!cacheBlock(queueItem->data + offset, len, br->ver, offset, queueItem->len)) break;
+        blocks++;
+    }
+    const uint16_t total = (queueItem->len + BLOCK_DATA_SIZE - 1) / BLOCK_DATA_SIZE;
+    char buffer[150];
+    sprintf(buffer, "%02X%02X%02X%02X%02X%02X%02X%02X %s sent to the radio in advance, %d of %d blocks in %lu ms", br->src[7], br->src[6], br->src[5], br->src[4], br->src[3], br->src[2], br->src[1], br->src[0], queueItem->filename, blocks, total, (unsigned long)(millis() - t));
+    wsLog((String)buffer);
+}
+
+// The radio sent a block to a tag: the live block x/total on the tag card, also for cached blocks
+// A v2 radio served a block from its cache. The log line starts with the MAC, so the tag card
+// flashes as it does for a block request on the old protocol.
+void processBlockServed(const struct v2BlockServed* bs) {
+    PendingItem* queueItem = getQueueItem(bs->mac, bs->dataVer);
+    if (queueItem == nullptr) return;
+    const uint16_t total = (queueItem->len + BLOCK_DATA_SIZE - 1) / BLOCK_DATA_SIZE;
+    char buffer[150];
+    snprintf(buffer, sizeof(buffer), "%02X%02X%02X%02X%02X%02X%02X%02X block served %s block %d, %d parts, %d frames, %d ms late",
+             bs->mac[7], bs->mac[6], bs->mac[5], bs->mac[4], bs->mac[3], bs->mac[2], bs->mac[1], bs->mac[0],
+             queueItem->filename, bs->blockId, bs->partsRequested, bs->framesSent, bs->lateMs);
+    wsLog((String)buffer);
+    wsSendUploadProgress(bs->mac, bs->blockId + 1, total);
 }
 
 void processXferComplete(struct espXferComplete* xfc, bool local) {
@@ -623,8 +661,8 @@ void processXferTimeout(struct espXferComplete* xfc, bool local) {
         taginfo->pendingIdle = 60;
         clearPending(taginfo);
     }
-    while (dequeueItem(xfc->src)) {
-    };
+    dequeueAllItems(xfc->src);
+    if (taginfo != nullptr) taginfo->pendingCount = countQueueItem(xfc->src);
 
     checkQueue(xfc->src);
 
@@ -632,11 +670,16 @@ void processXferTimeout(struct espXferComplete* xfc, bool local) {
     if (local) udpsync.netProcessXferTimeout(xfc);
 }
 
-void processDataReq(struct espAvailDataReq* eadr, bool local, IPAddress remoteIP) {
+void processDataReq(struct espAvailDataReq* eadr, bool local, IPAddress remoteIP, CheckinVia via) {
     if (config.runStatus == RUNSTATUS_STOP) {
         return;
     }
     char buffer[64];
+
+#ifdef HAS_BLE_WRITER
+    // a BLE display added on this AP stays here while this AP has it (roaming rules in od_session)
+    if (!local && bleFamily(eadr->src, 0) == BLE_FAMILY_OPENDISPLAY && odKeyAdded(eadr->src) && !odRemoteCheckin(eadr->src, remoteIP)) return;
+#endif
 
     char hexmac[17];
     mac2hex(eadr->src, hexmac);
@@ -655,6 +698,8 @@ void processDataReq(struct espAvailDataReq* eadr, bool local, IPAddress remoteIP
         }
         taginfo = addRecord(eadr->src);
     }
+    // Set before checkQueue() below, so the first check-in after a reboot is already announced.
+    if (via != CHECKIN_VIA_OTHER) taginfo->lastHeardOnRadio = (via == CHECKIN_VIA_RADIO);
     time_t now;
     time(&now);
 
@@ -675,7 +720,8 @@ void processDataReq(struct espAvailDataReq* eadr, bool local, IPAddress remoteIP
     uint32_t offeredSleep = 0;
     const bool offeredKnown = local && recordOffered(eadr->src, offeredSleep);
     // BLE displays don't get their instructions from the radio
-    const bool bleTag = ((eadr->adr.hwType & 0xB0) == 0xB0) || (eadr->src[7] == 0x13 && eadr->src[6] == 0x37);
+    const BleFamily family = tagBleFamily(eadr->src, taginfo, eadr->adr.hwType);
+    const bool bleTag = family != BLE_FAMILY_NONE;
     if (offeredKnown && !bleTag) {
         // The tag sleeps what the radio told it just now, counted down since it was announced (#466).
         // Without an instruction it checks in again after about 40 seconds.
@@ -718,15 +764,19 @@ void processDataReq(struct espAvailDataReq* eadr, bool local, IPAddress remoteIP
         }
 
         taginfo->LQI = eadr->adr.lastPacketLQI;
-        taginfo->hwType = eadr->adr.hwType;
         taginfo->RSSI = eadr->adr.lastPacketRSSI;
         taginfo->temperature = eadr->adr.temperature;
         taginfo->batteryMv = eadr->adr.batteryMv;
-        taginfo->hwType = eadr->adr.hwType;
         taginfo->wakeupReason = eadr->adr.wakeupReason;
         taginfo->capabilities = eadr->adr.capabilities;
         taginfo->currentChannel = eadr->adr.currentChannel;
-        taginfo->tagSoftwareVersion = eadr->adr.tagSoftwareVersion;
+        if (family == BLE_FAMILY_OPENDISPLAY) {
+            // type and firmware version come from the tag's config, the advertisement has neither
+            if (taginfo->hwType == 0) taginfo->hwType = HWTYPE_OPENDISPLAY_UNKNOWN;
+        } else {
+            taginfo->hwType = eadr->adr.hwType;
+            taginfo->tagSoftwareVersion = eadr->adr.tagSoftwareVersion;
+        }
     }
     if (local) {
         sprintf(buffer, "<ADR %02X%02X%02X%02X%02X%02X%02X%02X\r\n\0", eadr->src[7], eadr->src[6], eadr->src[5], eadr->src[4], eadr->src[3], eadr->src[2], eadr->src[1], eadr->src[0]);
@@ -743,7 +793,7 @@ void processDataReq(struct espAvailDataReq* eadr, bool local, IPAddress remoteIP
         // exactly once. A later check-in is treated as a wake-up (above) and clears
         // the marker. BLE displays are excluded: their deep sleep is delivered and
         // marked by the BLE writer, not over the 802.15.4 radio.
-        if (!(eadr->src[7] == 0x13 && eadr->src[6] == 0x37)) {
+        if (family != BLE_FAMILY_ATC) {
             PendingItem* sent = getQueueItem(eadr->src);
             if (sent != nullptr &&
                 sent->pendingdata.availdatainfo.dataType == DATATYPE_COMMAND_DATA &&
@@ -806,8 +856,12 @@ void updateContent(const uint8_t* dst) {
     }
 }
 
+extern int16_t radioLedBrightness;
+extern int16_t radioLock;
+
 void setAPchannel() {
-    bool bSendRadioLayer = false;
+    // v2 radios dim their LEDs along, and apply the tag inventory lock
+    bool bSendRadioLayer = config.led != radioLedBrightness || config.lock != radioLock;
     struct espSetChannelPower tmp;
     if (config.channel == 0) {
         // trigger channel autoselect
@@ -953,6 +1007,8 @@ void updateTaginfoitem(struct TagInfo* taginfoitem, IPAddress remoteIP) {
             taginfo->wakeupReason = taginfoitem->wakeupReason;
             taginfo->capabilities = taginfoitem->capabilities;
             taginfo->pendingIdle = taginfoitem->pendingIdle;
+            // the image hash, for the preview, of a tag whose content another AP makes
+            if (taginfo->contentMode == 12) memcpy(taginfo->md5, taginfoitem->md5, sizeof(taginfoitem->md5));
             break;
     }
 
@@ -1092,6 +1148,48 @@ bool dequeueItem(const uint8_t* targetMac, const uint64_t dataVer) {
     return false;
 }
 
+/// @brief Leave only the .pending files that no queued item uses (mirrored tags share the file), and drop keep
+/// @note Caller holds queueMutex
+static void keepUnusedPendingFiles(std::vector<String>& files, const char* keep) {
+    files.erase(std::remove_if(files.begin(), files.end(),
+                               [keep](const String& filename) {
+                                   if (!filename.endsWith(".pending") || (keep != nullptr && filename == keep)) return true;
+                                   for (const PendingItem* item : pendingQueue) {
+                                       if (filename == item->filename) return true;
+                                   }
+                                   return false;
+                               }),
+                files.end());
+}
+
+static void removeFiles(const std::vector<String>& files) {
+    for (const String& filename : files) {
+        xSemaphoreTake(fsMutex, portMAX_DELAY);
+        contentFS->remove(filename);
+        xSemaphoreGive(fsMutex);
+    }
+}
+
+void dequeueAllItems(const uint8_t* targetMac) {
+    // the .pending files go too: nothing removes them later, until the next boot
+    std::vector<String> obsoleteFiles;
+    {
+        std::lock_guard<std::recursive_mutex> lock(queueMutex);
+        for (size_t c = 0; c < pendingQueue.size();) {
+            PendingItem* item = pendingQueue[c];
+            if (memcmp(item->pendingdata.targetMac, targetMac, sizeof(item->pendingdata.targetMac)) == 0) {
+                pendingQueue.erase(pendingQueue.begin() + c);
+                retireItem(item);
+                obsoleteFiles.push_back(item->filename);
+            } else {
+                c++;
+            }
+        }
+        keepUnusedPendingFiles(obsoleteFiles, nullptr);
+    }
+    removeFiles(obsoleteFiles);
+}
+
 static size_t queueSize() {
     std::lock_guard<std::recursive_mutex> lock(queueMutex);
     return pendingQueue.size();
@@ -1203,22 +1301,9 @@ bool queueDataAvail(struct pendingData* pending, bool local) {
                     c++;
                 }
             }
-            // keep files that are still used (mirrored tags share the file)
-            obsoleteFiles.erase(std::remove_if(obsoleteFiles.begin(), obsoleteFiles.end(),
-                                               [&newPending](const String& filename) {
-                                                   if (!filename.endsWith(".pending") || filename == newPending.filename) return true;
-                                                   for (const PendingItem* item : pendingQueue) {
-                                                       if (filename == item->filename) return true;
-                                                   }
-                                                   return false;
-                                               }),
-                                obsoleteFiles.end());
+            keepUnusedPendingFiles(obsoleteFiles, newPending.filename);
         }
-        for (const String& filename : obsoleteFiles) {
-            xSemaphoreTake(fsMutex, portMAX_DELAY);
-            contentFS->remove(filename);
-            xSemaphoreGive(fsMutex);
-        }
+        removeFiles(obsoleteFiles);
     }
 
     enqueueItem(newPending);

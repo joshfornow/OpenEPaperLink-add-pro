@@ -376,7 +376,9 @@ function processTags(tagArray) {
 			$('#tag' + tagmac + ' .mac').innerHTML = tagmac;
 		}
 		let alias = element.alias;
-		if (!alias) {
+		if (!alias && tagmac.startsWith('2446')) {
+			alias = 'OD' + tagmac.slice(-6);  // OpenDisplay tags call themselves that
+		} else if (!alias) {
 			alias = tagmac.replace(/^0{1,4}/, '');
 			if (alias.match(/^4467/)) {
 				let macdigit = Number.parseInt(alias.substr(4, 2), 16) & 0x1f;
@@ -398,14 +400,23 @@ function processTags(tagArray) {
 			div.dataset.hwtype = element.hwType;
 			(async () => {
 				const localTagmac = tagmac;
-				const data = await getTagtype(element.hwType);
+				const data = await getTagtype(element.hwType, element.isexternal ? element.apip : null);
 				div.dataset.usetemplate = data.usetemplate;
 				if (data.usetemplate != 0) {
 					const template = await getTagtype(data.usetemplate);
+					// a type the AP made itself has no content list of its own
+					if (!data.contentids?.length && template?.contentids) data.contentids = template.contentids;
 				}
 				$('#tag' + localTagmac + ' .model').innerHTML = data.name;
 				$('#tag' + localTagmac + ' .resolution').innerHTML = data.width + "x" + data.height;
-				if (element.ver != 0 && element.ver != 1) {
+				if (element.od && element.hwType == 0x100) {
+					// OpenDisplay tag whose type the AP doesn't know yet
+					$('#tag' + localTagmac + ' .model').innerHTML = element.od.width ? 'OpenDisplay ' + element.od.colors : 'OpenDisplay, ' + element.od.state;
+					$('#tag' + localTagmac + ' .resolution').innerHTML = element.od.width ? element.od.width + "x" + element.od.height : '';
+				}
+				if (element.od && element.ver) {
+					$('#tag' + localTagmac + ' .resolution').innerHTML += ` fw:${element.ver >> 8}.${element.ver & 0xff}`;
+				} else if (element.ver != 0 && element.ver != 1) {
 					div.dataset.ver = element.ver;
 					$('#tag' + localTagmac + ' .resolution').innerHTML += ` fw:${element.ver} 0x${element.ver.toString(16)}`;
 				}
@@ -666,8 +677,47 @@ function loadContentCard(mac) {
 			$('#cfginvert').value = tagdata.invert;
 			$('#cfgmore').innerHTML = '&#x25BC;';
 			$('#cfgmac').dataset.ch = tagdata.ch;
+			loadOdKeyState(mac);
 			$('#configbox').showModal();
 		})
+}
+
+// OpenDisplay BLE tags: the AP only connects to tags the user added, with their key or without
+// one. It only says whether it has a key, never the key itself.
+function loadOdKeyState(mac) {
+	$('#cfgodkey').value = '';
+	$('#cfgodkeyrow').style.display = 'none';
+	$('#cfgodkeybuttons').style.display = 'none';
+	if (!mac.startsWith('2446')) return;
+	fetch('od_key?mac=' + mac)
+		.then(response => response.ok ? response.json() : null)
+		.then(state => {
+			if (!state) return;
+			$('#cfgodkey').placeholder = state.set ? 'set (type to replace)' : state.added ? 'added without key' : 'not added';
+			$('#cfgodkeyadd').style.display = state.added ? 'none' : '';
+			$('#cfgodkeyclear').style.display = state.added ? '' : 'none';
+			$('#cfgodkeyrow').style.display = '';
+			$('#cfgodkeybuttons').style.display = '';
+		});
+}
+
+function postOdKey(mac, params) {
+	let formData = new FormData();
+	formData.append("mac", mac);
+	for (const [name, value] of Object.entries(params)) formData.append(name, value);
+	return fetch("od_key", { method: "POST", body: formData })
+		.then(response => response.text().then(text => showMessage(text, !response.ok)))
+		.catch(error => showMessage('Error: ' + error, true));
+}
+
+$('#cfgodkeyadd').onclick = function () {
+	const mac = $('#cfgmac').dataset.mac;
+	postOdKey(mac, { add: 1 }).then(() => loadOdKeyState(mac));
+}
+
+$('#cfgodkeyclear').onclick = function () {
+	const mac = $('#cfgmac').dataset.mac;
+	postOdKey(mac, { key: '' }).then(() => loadOdKeyState(mac));
 }
 
 let typedString = '';
@@ -693,6 +743,14 @@ $('#cfgmore').onclick = function () {
 };
 
 $('#cfgsave').onclick = function () {
+	const odKey = $('#cfgodkey').value.trim();
+	if (odKey != '') {
+		if (!/^[0-9a-fA-F]{32}$/.test(odKey)) {
+			showMessage('The encryption key is 32 hex digits', true);
+			return;
+		}
+		postOdKey($('#cfgmac').dataset.mac, { key: odKey });
+	}
 	let contentMode = $('#cfgcontent').value;
 	let contentDef = getContentDefById(contentMode);
 	let extraoptions = contentDef?.param ?? null;
@@ -790,9 +848,9 @@ $('#cfgautoupdate').onclick = async function () {
 	var infourl = "https://raw.githubusercontent.com/" + repo + "/master/binaries/Tag/tagotaversions.json";
 	var info = "";
 	await fetch(infourl, { method: 'GET' }).then(await function (response) { return response.json(); }).then(await function (json) { info = json; });
-	var tagtype = ("0" + (Number($('#tag' + mac).dataset.hwtype).toString(16))).slice(-2).toUpperCase();
-	var name = info[0][tagtype]["type"];
-	if (name == "") {
+	var tagtype = hwTypeHex($('#tag' + mac).dataset.hwtype);
+	var name = info[0][tagtype]?.["type"];
+	if (!name) {
 		alert("Tag id not known");
 		return false;
 	}
@@ -901,6 +959,7 @@ document.addEventListener("loadTab", function (event) {
 						$("#apcnightlyreboot").value = data.nightlyreboot;
 						$("#apclock").value = data.lock;
 						$("#apcwifipower").value = data.wifipower;
+						$("#apchotspotpw").value = data.hotspotpw || "";
 						$("#apctimezone").value = data.timezone;
 						$("#apcnight1").value = data.sleeptime1;
 						$("#apcnight2").value = data.sleeptime2;
@@ -940,6 +999,12 @@ $('#apcfgsave').onclick = function () {
 	formData.append('nightlyreboot', $('#apcnightlyreboot').value);
 	formData.append('lock', $('#apclock').value);
 	formData.append('wifipower', $('#apcwifipower').value);
+	const hotspotpw = $('#apchotspotpw').value;
+	if (hotspotpw.length > 0 && (hotspotpw.length < 8 || hotspotpw.length > 63)) {
+		$('#apcfgmsg').innerHTML = 'Hotspot password needs 8 to 63 characters';
+		return;
+	}
+	formData.append('hotspotpw', hotspotpw);
 	formData.append('timezone', $('#apctimezone').value);
 	formData.append('sleeptime1', $('#apcnight1').value);
 	formData.append('sleeptime2', $('#apcnight2').value);
@@ -1105,7 +1170,7 @@ function contentselected() {
 				case 'binfile':
 				case 'jsonfile':
 					input = document.createElement("select");
-					fetch('edit?list=%2F&recursive=1')
+					fetch('edit?list=%2F&recursive=1&nosize=1')
 						.then(response => response.json())
 						.then(data => {
 							let files = data.filter(item => item.type === "file" && (item.name.toLowerCase().endsWith(".jpg") || item.name.toLowerCase().endsWith(".jpeg")));
@@ -1331,7 +1396,7 @@ function processQueue() {
 		.then(response => response.arrayBuffer())
 		.then(buffer => {
 
-			drawCanvas(buffer, canvas, hwtype, id, true);
+			drawCanvas(buffer, canvas, hwtype, id);
 			processQueue();
 		})
 		.catch(error => {
@@ -1340,7 +1405,7 @@ function processQueue() {
 		});
 }
 
-function drawCanvas(buffer, canvas, hwtype, tagmac, doRotate) {
+function drawCanvas(buffer, canvas, hwtype, tagmac) {
 	data = new Uint8ClampedArray(buffer);
 	if (data.length > 0 && tagTypes[hwtype].zlib > 0 && $('#tag' + tagmac).dataset.ver >= tagTypes[hwtype].zlib) {
 		data = processZlib(data);
@@ -1359,20 +1424,6 @@ function drawCanvas(buffer, canvas, hwtype, tagmac, doRotate) {
 	[canvas.width, canvas.height] = [tagTypes[hwtype].width, tagTypes[hwtype].height] || [0, 0];
 	if (tagTypes[hwtype].rotatebuffer % 2) [canvas.width, canvas.height] = [canvas.height, canvas.width];
 	if (tagTypes[hwtype].rotatebuffer >= 2) canvas.style.transform = 'rotate(180deg)';
-	if (doRotate == false && tagTypes[hwtype].rotatebuffer == 1) {
-		canvas.style.transform = 'rotate(90deg)';
-		canvas.style.transformOrigin = 'top left';
-		canvas.style.position = 'absolute';
-		canvas.style.left = canvas.height + 15;
-		canvas.style.top = 15;
-	}
-	if (doRotate == false && tagTypes[hwtype].rotatebuffer == 3) {
-		canvas.style.transform = 'rotate(270deg)';
-		canvas.style.transformOrigin = 'top left';
-		canvas.style.position = 'absolute';
-		canvas.style.top = (canvas.width + 15) + 'px';
-		canvas.style.left = 15;
-	}
 	const ctx = canvas.getContext('2d');
 	const imageData = ctx.createImageData(canvas.width, canvas.height);
 	if (data.length == 0) {
@@ -1581,11 +1632,12 @@ $('#activefilter').addEventListener('click', (event) => {
 	filterOptions.style.maxHeight = filterOptions.scrollHeight + 20 + 'px';
 });
 
-const downloadTagtype = async (hwtype) => {
+// from the repo, or with fromAp from another AP (the AP's own types above 0xFF)
+const downloadTagtype = async (hwtype, fromAp) => {
 	try {
 		console.log("download tagtype " + hwtype);
 		let repo = apConfig.repo || 'OpenEPaperLink/OpenEPaperLink';
-		let url = "https://raw.githubusercontent.com/" + repo + "/master/resources/tagtypes/" + hwtype + ".json";
+		let url = fromAp ? "http://" + fromAp + "/tagtypes/" + hwtype + ".json" : "https://raw.githubusercontent.com/" + repo + "/master/resources/tagtypes/" + hwtype + ".json";
 		console.log(url);
 
 		const response = await fetch(url);
@@ -1615,7 +1667,13 @@ const downloadTagtype = async (hwtype) => {
 	}
 };
 
-async function getTagtype(hwtype) {
+// tag type id as used in the file name: two hex digits, four above 0xFF
+function hwTypeHex(hwtype) {
+	return Number(hwtype).toString(16).toUpperCase().padStart(Number(hwtype) > 0xFF ? 4 : 2, '0');
+}
+
+// apip: the AP that has the tag, for a type of its own (above 0xFF) that this AP doesn't have
+async function getTagtype(hwtype, apip) {
 	if (tagTypes[hwtype] && tagTypes[hwtype].busy == false) {
 		return tagTypes[hwtype];
 	}
@@ -1657,14 +1715,17 @@ async function getTagtype(hwtype) {
 	try {
 		getTagtypeBusy = true;
 		tagTypes[hwtype] = { busy: true };
-		let response = await fetch('tagtypes/' + hwtype.toString(16).padStart(2, '0').toUpperCase() + '.json');
+		let response = await fetch('tagtypes/' + hwTypeHex(hwtype) + '.json');
 
-		if (response.status === 404) {
-			response = await downloadTagtype(hwtype.toString(16).padStart(2, '0').toUpperCase());
+		// types above 0xFF are made by an AP itself, the repo doesn't have them
+		if (response.status === 404 && hwtype <= 0xFF) {
+			response = await downloadTagtype(hwTypeHex(hwtype));
+		} else if (response.status === 404 && apip && apip != '0.0.0.0') {
+			response = await downloadTagtype(hwTypeHex(hwtype), apip);
 		}
 
 		if (!response.ok) {
-			let data = { name: 'unknown id ' + hwtype.toString(16).toUpperCase(), width: 0, height: 0, bpp: 0, rotatebuffer: 0, colortable: [], busy: false };
+			let data = { name: 'unknown id ' + hwtype.toString(16).toUpperCase(), width: 0, height: 0, bpp: 0, rotatebuffer: 0, colortable: [], busy: false, usetemplate: 0 };
 			tagTypes[hwtype] = data;
 			getTagtypeBusy = false;
 			return data;
@@ -2154,7 +2215,7 @@ function renderDashboard() {
 		const contentName = getContentDefById(tag.contentMode)?.name;
 		if (contentName) content[contentName] = (content[contentName] || 0) + 1;
 		if (tag.RSSI) {
-			const typeName = tagTypes[tag.hwType]?.name || 'type ' + Number(tag.hwType).toString(16).toUpperCase().padStart(2, '0');
+			const typeName = tagTypes[tag.hwType]?.name || 'type ' + hwTypeHex(tag.hwType);
 			types[typeName] = (types[typeName] || 0) + 1;
 		}
 
@@ -2348,10 +2409,19 @@ function backupTagDB() {
 	localStorage.setItem("tagDB", JSON.stringify(tagDB));
 }
 
+// margin around the preview in its window, in CSS pixels
+const previewMargin = 15;
+
 function openPreview(mac, w, h) {
-	const previewWindow = window.open("", `PreviewWindow_${mac}`, `width=${w + 30},height=${h + 30},menubar=no,toolbar=no,location=no,status=no,resizable=no,scrollbars=no`);
+	const size = previewSize(w, h);
+	// centre it on this window, so it lands on the same screen
+	const left = Math.round(window.screenX + (window.outerWidth - size.w) / 2);
+	const top = Math.round(window.screenY + (window.outerHeight - size.h) / 2);
+	const previewWindow = window.open("", `PreviewWindow_${mac}`, `popup,width=${size.w},height=${size.h},left=${left},top=${top}`);
 
 	if (previewWindow) {
+		// a preview of this tag that is already open stays where the user put it
+		const isNew = !previewWindow.document.getElementById('preview');
 		previewWindow.mac = mac;
 		previewWindows.push(previewWindow);
 		const element = tagDB[mac];
@@ -2360,13 +2430,21 @@ function openPreview(mac, w, h) {
 		previewWindow.pending = 0;
 		previewWindow.focus();
 
-		console.log(element);
-		console.log(tagTypes[element.hwType]);
 		previewWindow.document.head.innerHTML = `<title>${tagTypes[element.hwType].name + ' ' + mac}</title>`;
-		previewWindow.document.body.style.backgroundColor = "#dddddd";
-		previewWindow.document.body.style.margin = "15px";
-		previewWindow.document.body.style.overflow = "hidden";
-		previewWindow.document.body.innerHTML = `<canvas id="preview" style="border:1px solid #888888;image-rendering: pixelated;"></canvas>`;
+		const body = previewWindow.document.body;
+		body.style.cssText = `margin:0;height:100vh;overflow:hidden;background:#dddddd;display:flex;align-items:center;justify-content:center`;
+		body.innerHTML = `<canvas id="preview" style="border:1px solid #888888;image-rendering:pixelated;box-sizing:content-box"></canvas>`;
+
+		// browsers may ignore the size given to window.open (Chrome opens it as large as its own window):
+		// size and centre it once it exists, then let the preview follow the window when the user resizes it
+		if (isNew) setTimeout(() => {
+			const outerW = size.w + previewWindow.outerWidth - previewWindow.innerWidth;
+			const outerH = size.h + previewWindow.outerHeight - previewWindow.innerHeight;
+			previewWindow.resizeTo(outerW, outerH);
+			previewWindow.moveTo(Math.round(window.screenX + (window.outerWidth - outerW) / 2),
+				Math.round(window.screenY + (window.outerHeight - outerH) / 2));
+		}, 50);
+		previewWindow.addEventListener('resize', () => fitPreview(previewWindow));
 
 		showPreview(previewWindow, element);
 
@@ -2412,10 +2490,34 @@ function showPreview(previewWindow, element) {
 		fetch(imageSrc)
 			.then(response => response.arrayBuffer())
 			.then(buffer => {
-				drawCanvas(buffer, canvas, element.hwType, element.mac, false);
+				// decode as on the tag cards, then turn the buffer the way the tag shows it
+				const buf = document.createElement('canvas');
+				drawCanvas(buffer, buf, element.hwType, element.mac);
+				const turns = (tagTypes[element.hwType].rotatebuffer || 0) % 4;
+				[canvas.width, canvas.height] = turns % 2 ? [buf.height, buf.width] : [buf.width, buf.height];
+				const ctx = canvas.getContext('2d');
+				ctx.translate(canvas.width / 2, canvas.height / 2);
+				ctx.rotate(turns * Math.PI / 2);
+				ctx.drawImage(buf, -buf.width / 2, -buf.height / 2);
+				fitPreview(previewWindow);
 			})
 			.catch(error => {
 				console.error('fetch preview image error:', error);
 			});
 	}
+}
+
+// window size (inner, CSS pixels) that shows a w x h preview at its own size
+function previewSize(w, h) {
+	return { w: w + 2 * previewMargin + 2, h: h + 2 * previewMargin + 2 };
+}
+
+// scale the preview to the largest size that fits the window, keeping its aspect ratio
+function fitPreview(previewWindow) {
+	const canvas = previewWindow.document.getElementById('preview');
+	if (!canvas || !canvas.width || !canvas.height) return;
+	const scale = Math.min((previewWindow.innerWidth - 2 * previewMargin - 2) / canvas.width,
+		(previewWindow.innerHeight - 2 * previewMargin - 2) / canvas.height);
+	canvas.style.width = Math.max(1, Math.floor(canvas.width * scale)) + 'px';
+	canvas.style.height = Math.max(1, Math.floor(canvas.height * scale)) + 'px';
 }

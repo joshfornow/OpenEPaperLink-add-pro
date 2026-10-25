@@ -1,6 +1,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_task_wdt.h>
 #include <time.h>
 #ifdef ETHERNET_CLK_MODE
 #include <ETH.h>
@@ -38,6 +39,7 @@ util::Timer intervalContentRunner(seconds(1));
 util::Timer intervalSysinfo(seconds(5));
 util::Timer intervalVars(seconds(10));
 util::Timer intervalSaveDB(minutes(5));
+util::Timer intervalFreeSpace(minutes(5), minutes(5));
 
 SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
@@ -62,6 +64,9 @@ void setup() {
     Serial.setTxTimeoutMs(0); // workaround bug in USB CDC that slows down serial output when no usb connected
 #endif
     Serial.print(">\r\n");
+    // A single LittleFS call (used-space walk, block allocation) can keep the idle task of core 0 from running
+    // for longer than the default 5 s. That is slow, not hung: allow 30 s before the task watchdog resets.
+    esp_task_wdt_init(30, true);
 #ifdef HAS_TFT
     extern void yellow_ap_display_init(void);
     yellow_ap_display_init();
@@ -126,6 +131,7 @@ void setup() {
     enableNtpFromDhcp();
     wm.initEth();
     initAPconfig();
+    wm.checkResetSequence();
 
     updateLanguageFromConfig();
     updateBrightnessFromConfig();
@@ -190,6 +196,7 @@ void setup() {
 
     xTaskCreate(delayedStart, "delaystart", 5000, NULL, 2, NULL);
 
+    Storage.freeSpace();
     wsSendSysteminfo();
     util::printHeap();
 }
@@ -199,6 +206,9 @@ void loop() {
     wm.poll();
     handleRestartRequest();
 
+    if (intervalFreeSpace.doRun()) {
+        Storage.freeSpace();  // walks the whole file system; sysinfo reports the last result
+    }
     if (intervalSysinfo.doRun()) {
         wsSendSysteminfo();
     }

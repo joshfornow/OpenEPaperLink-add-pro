@@ -15,10 +15,13 @@
 #include "AsyncJson.h"
 #include "LittleFS.h"
 #include "SPIFFSEditor.h"
+#include "ble_writer.h"
 #include "commstructs.h"
 #include "language.h"
 #include "leds.h"
 #include "newproto.h"
+#include "od_keys.h"
+#include "od_session.h"
 #include "pendingupload.h"
 #include "radioselftest.h"
 #include "ota.h"
@@ -120,21 +123,20 @@ void wsSendSysteminfo() {
     JsonObject sys = doc["sys"].to<JsonObject>();
     time_t now;
     time(&now);
-    static int freeSpaceLastRun = 0;
+    static int tagDBsizeLastRun = 0;
     static size_t tagDBsize = 0;
-    static uint64_t freeSpace = Storage.freeSpace();
 
     sys["currtime"] = now;
     sys["heap"] = ESP.getFreeHeap();
     sys["recordcount"] = tagDBsize;
     sys["dbsize"] = dbSize();
 
-    if (millis() - freeSpaceLastRun > 30000 || freeSpaceLastRun == 0) {
-        freeSpace = Storage.freeSpace();
+    if (millis() - tagDBsizeLastRun > 30000 || tagDBsizeLastRun == 0) {
         tagDBsize = tagDB.size();
-        freeSpaceLastRun = millis();
+        tagDBsizeLastRun = millis();
     }
-    sys["littlefsfree"] = freeSpace;
+    // measuring walks the whole file system: report the last measurement, minus what was reserved since
+    sys["littlefsfree"] = Storage.knownFreeSpace();
 
 #if BOARD_HAS_PSRAM
     sys["psfree"] = ESP.getFreePsram();
@@ -175,9 +177,18 @@ void wsSendSysteminfo() {
     setVarDB("ap_ch", String(apInfo.channel));
 #endif
 
-    // reboot once at night
+    // reboot once at night, or when the BLE task hangs: only a reboot gets it going again
+    const char* rebootReason = nullptr;
     if (timeinfo.tm_hour == 3 && timeinfo.tm_min == 56 && millis() > 2 * 3600 * 1000 && config.nightlyreboot == 1) {
-        logLine("Nightly reboot");
+        rebootReason = "Nightly reboot";
+    }
+#ifdef HAS_BLE_WRITER
+    else if (BLE_taskHung()) {
+        rebootReason = "BLE task hangs, reboot";
+    }
+#endif
+    if (rebootReason != nullptr) {
+        logLine(rebootReason);
         wsErr("REBOOTING");
         config.runStatus = RUNSTATUS_STOP;
         ws.enable(false);
@@ -248,6 +259,7 @@ void wsSendTaginfo(const uint8_t *mac, uint8_t syncMode) {
                     taginfoitem.wakeupReason = taginfo->wakeupReason;
                     taginfoitem.capabilities = taginfo->capabilities;
                     taginfoitem.pendingIdle = taginfo->pendingIdle;
+                    memcpy(taginfoitem.md5, taginfo->md5, sizeof(taginfoitem.md5));
                 }
                 udpsync.netTaginfo(&taginfoitem);
             }
@@ -290,6 +302,11 @@ void wsSerial(const String &text, const String &color) {
 
 uint8_t wsClientCount() {
     return ws.count();
+}
+
+// Empty means an open hotspot; WPA2 takes 8 to 63 characters
+static bool validHotspotPassword(const String &pw) {
+    return pw.length() == 0 || (pw.length() >= 8 && pw.length() <= 63);
 }
 
 void init_web() {
@@ -423,6 +440,55 @@ void init_web() {
         request->send(200, "text/plain", "Ok, saved");
     });
 
+#ifdef HAS_BLE_WRITER
+    // OpenDisplay tag, added by the user with or without an encryption key: GET says whether it
+    // is added and has a key (never the key itself); POST sets the key (32 hex digits), adds the
+    // tag without one (add=1) or removes either (empty key)
+    server.on("/od_key", HTTP_ANY, [](AsyncWebServerRequest *request) {
+        const bool post = request->method() == HTTP_POST;
+        uint8_t mac[8];
+        if (!request->hasParam("mac", post) || !hex2mac(request->getParam("mac", post)->value(), mac) ||
+            bleFamily(mac, 0) != BLE_FAMILY_OPENDISPLAY) {
+            request->send(400, "text/plain", "Not an OpenDisplay tag");
+            return;
+        }
+        if (!post) {
+            const bool set = odKeyHas(mac);
+            request->send(200, "application/json", String("{\"set\":") + (set ? "true" : "false") + ",\"added\":" + (set || odKeyAdded(mac) ? "true" : "false") + "}");
+            return;
+        }
+        if (request->hasParam("add", true)) {
+            const bool added = odKeyAddWithoutKey(mac);
+            odKeyChanged(mac);
+            wsSendTaginfo(mac, SYNC_NOSYNC);
+            request->send(200, "text/plain", added ? "Tag added without a key" : "Error adding the tag");
+            return;
+        }
+        const String hex = request->hasParam("key", true) ? request->getParam("key", true)->value() : "";
+        if (hex.isEmpty()) {
+            odKeyClear(mac);
+            odForget(mac);
+            wsSendTaginfo(mac, SYNC_NOSYNC);  // this AP's view only, the tag may be on another AP
+            request->send(200, "text/plain", "Removed: the AP no longer connects to this tag");
+            return;
+        }
+        uint8_t key[16];
+        bool valid = hex.length() == 32;
+        for (int i = 0; valid && i < 32; i++) valid = isxdigit(hex[i]);
+        if (valid) {
+            for (int i = 0; i < 16; i++) key[i] = strtoul(hex.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
+        } else {
+            request->send(400, "text/plain", "The key is 32 hex digits");
+            return;
+        }
+        const bool saved = odKeySet(mac, key);
+        memset(key, 0, sizeof(key));
+        odKeyChanged(mac);
+        wsSendTaginfo(mac, SYNC_NOSYNC);
+        request->send(200, "text/plain", saved ? "Key saved" : "Error saving the key");
+    });
+#endif
+
     server.on("/tag_cmd", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (request->hasParam("mac", true) && request->hasParam("cmd", true)) {
             uint8_t mac[8];
@@ -446,8 +512,7 @@ void init_web() {
                     }
                     if (strcmp(cmdValue, "clear") == 0) {
                         clearPending(taginfo);
-                        while (dequeueItem(mac)) {
-                        };
+                        dequeueAllItems(mac);
                         taginfo->pendingCount = countQueueItem(mac);
                         wsSendTaginfo(mac, SYNC_TAGSTATUS);
                     }
@@ -592,6 +657,17 @@ void init_web() {
         response->print("\"hasSubGhz\": \"0\", ");
 #endif
 
+        {
+            Preferences preferences;
+            preferences.begin("wifi", true);
+            JsonDocument pw;
+            pw.set(preferences.getString("appw", ""));
+            preferences.end();
+            response->print("\"hotspotpw\": ");
+            serializeJson(pw, *response);
+            response->print(", ");
+        }
+
         response->print("\"apstate\": \"" + String(apInfo.state) + "\"");
 
         File configFile = contentFS->open("/current/apconfig.json", "r");
@@ -613,6 +689,17 @@ void init_web() {
     });
 
     server.on("/save_apcfg", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (request->hasParam("hotspotpw", true)) {
+            const String pw = request->getParam("hotspotpw", true)->value();
+            if (!validHotspotPassword(pw)) {
+                request->send(400, "text/plain", "Hotspot password needs 8 to 63 characters");
+                return;
+            }
+            Preferences preferences;
+            preferences.begin("wifi", false);
+            preferences.putString("appw", pw);
+            preferences.end();
+        }
         if (request->hasParam("alias", true)) {
             String aliasValue = request->getParam("alias", true)->value();
             size_t aliasLength = aliasValue.length();
@@ -780,6 +867,8 @@ void init_web() {
         for (size_t i = 0; i < numKeys; i++) {
             doc[keys[i]] = preferences.getString(keys[i], "");
         }
+        doc["appw"] = preferences.getString("appw", "");
+        doc["apfallback"] = preferences.getUChar("apfallback", 1);
         doc["mac"] = WiFi.macAddress();
         serializeJson(doc, *response);
         request->send(response);
@@ -813,15 +902,22 @@ void init_web() {
 
     AsyncCallbackJsonWebHandler *handler = new AsyncCallbackJsonWebHandler("/save_wifi_config", [](AsyncWebServerRequest *request, JsonVariant &json) {
         const JsonObject &jsonObj = json.as<JsonObject>();
+        if (jsonObj["appw"].is<String>() && !validHotspotPassword(jsonObj["appw"].as<String>())) {
+            request->send(400, "text/plain", "Hotspot password needs 8 to 63 characters");
+            return;
+        }
         Preferences preferences;
         preferences.begin("wifi", false);
-        const char *keys[] = {"ssid", "pw", "ip", "mask", "gw", "dns"};
+        const char *keys[] = {"ssid", "pw", "ip", "mask", "gw", "dns", "appw"};
         const size_t numKeys = sizeof(keys) / sizeof(keys[0]);
         for (size_t i = 0; i < numKeys; i++) {
             String key = keys[i];
             if (jsonObj[key].is<String>()) {
                 preferences.putString(key.c_str(), jsonObj[key].as<String>());
             }
+        }
+        if (jsonObj["apfallback"].is<int>()) {
+            preferences.putUChar("apfallback", jsonObj["apfallback"].as<int>() ? 1 : 0);
         }
         preferences.end();
         Serial.println("config saved");
@@ -863,6 +959,7 @@ void init_web() {
         request->send(erased ? 200 : 500, "text/plain", erased ? "OK" : "Failed");
     });
     server.on("/check_file", HTTP_GET, handleCheckFile);
+    server.on("/github_proxy", HTTP_GET, handleGithubProxy);
     server.on("/rollback", HTTP_POST, handleRollback);
     server.on("/update_c6", HTTP_POST, handleUpdateC6);
     /* Radio wiring self-test (task #32). POST starts it (the radio is offline
